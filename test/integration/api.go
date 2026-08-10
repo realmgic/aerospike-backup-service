@@ -3,13 +3,17 @@
 package integration
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aerospike/aerospike-backup-service/v3/pkg/dto"
+	"github.com/aerospike/aerospike-backup-service/v3/pkg/model"
 )
 
 const (
@@ -141,4 +145,88 @@ func (s *Suite) getFullBackups(e *env) []dto.BackupDetails {
 	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&backups))
 
 	return backups
+}
+
+// restoreFullURL is the full-restore endpoint.
+func (e *env) restoreFullURL() string {
+	return fmt.Sprintf("%s/v1/restore/full", e.server.URL)
+}
+
+// restoreStatusURL is the status endpoint for a given restore job.
+func (e *env) restoreStatusURL(jobID model.RestoreJobID) string {
+	return fmt.Sprintf("%s/v1/restore/status/%d", e.server.URL, jobID)
+}
+
+// triggerRestore submits a full restore of backupDataPath into the suite's Aerospike cluster and
+// returns the assigned job ID.
+func (s *Suite) triggerRestore(e *env, backupDataPath string) model.RestoreJobID {
+	body, err := json.Marshal(dto.RestoreRequest{
+		DestinationClusterConfig: dto.DestinationClusterConfig{Name: clusterName},
+		StorageConfig:            dto.StorageConfig{Name: storageName},
+		Policy:                   &dto.RestorePolicy{},
+		BackupDataPath:           backupDataPath,
+	})
+	s.Require().NoError(err)
+
+	req, err := http.NewRequestWithContext(
+		s.T().Context(), http.MethodPost, e.restoreFullURL(), bytes.NewReader(body),
+	)
+	s.Require().NoError(err)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	s.Require().NoError(err)
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	s.Require().NoError(err)
+
+	if resp.StatusCode != http.StatusAccepted {
+		s.Require().Failf("failed to trigger restore", "status %d: %s", resp.StatusCode, respBody)
+	}
+
+	jobID, err := strconv.ParseInt(strings.TrimSpace(string(respBody)), 10, 64)
+	s.Require().NoError(err)
+
+	return model.RestoreJobID(jobID)
+}
+
+// waitForRestoreStatus polls the restore job until it leaves the running state, and returns its
+// final status.
+func (s *Suite) waitForRestoreStatus(e *env, jobID model.RestoreJobID) dto.RestoreJobStatus {
+	deadline := time.Now().Add(backupTimeout)
+
+	for {
+		status := s.getRestoreStatus(e, jobID)
+		if status.Status != dto.RestoreRunning {
+			return status
+		}
+
+		if time.Now().After(deadline) {
+			s.Require().Failf("timed out waiting for restore job to finish",
+				"job %d still %q after %s", jobID, status.Status, backupTimeout)
+		}
+
+		time.Sleep(pollInterval)
+	}
+}
+
+// getRestoreStatus fetches the current status of a restore job.
+func (s *Suite) getRestoreStatus(e *env, jobID model.RestoreJobID) dto.RestoreJobStatus {
+	req, err := http.NewRequestWithContext(s.T().Context(), http.MethodGet, e.restoreStatusURL(jobID), nil)
+	s.Require().NoError(err)
+
+	resp, err := http.DefaultClient.Do(req)
+	s.Require().NoError(err)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		s.Require().Failf("failed to fetch restore status", "status %d: %s", resp.StatusCode, body)
+	}
+
+	var status dto.RestoreJobStatus
+	s.Require().NoError(json.NewDecoder(resp.Body).Decode(&status))
+
+	return status
 }

@@ -17,6 +17,7 @@ import (
 const (
 	lastSuccessfulBackupTimestampMetric = "aerospike_backup_service_last_successful_backup_timestamp"
 	backupEventsTotalMetric             = "aerospike_backup_service_backup_events_total"
+	restoreEventsTotalMetric            = "aerospike_backup_service_restore_events_total"
 )
 
 func (e *env) metricsURL() string {
@@ -119,6 +120,21 @@ func (e *env) backupSuccessEventCount(ctx context.Context, backupType model.Back
 	value, ok := counterValue(families, backupEventsTotalMetric, prommodel.LabelSet{
 		"routine": prommodel.LabelValue(routineName),
 		"type":    prommodel.LabelValue(backupType),
+		"outcome": "success",
+	})
+
+	return value, ok, nil
+}
+
+// restoreSuccessEventCount returns restore_events_total{outcome="success"}. Unlike backup events,
+// restore events carry no routine/type labels.
+func (e *env) restoreSuccessEventCount(ctx context.Context) (float64, bool, error) {
+	families, err := e.fetchMetricFamilies(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+
+	value, ok := counterValue(families, restoreEventsTotalMetric, prommodel.LabelSet{
 		"outcome": "success",
 	})
 
